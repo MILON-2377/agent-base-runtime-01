@@ -44,9 +44,13 @@ class RetryPolicy:
                 reason="max_attempts_reached",
             )
 
+        # Calculate delay for the next attempt.
+        delay = self._calculate_delay(failure.attempt_number)
+
         # Retry is allowed.
         return RetryDecision(
             should_retry=True,
+            delay_seconds=delay,
             reason="retryable_failure",
         )
 
@@ -58,3 +62,9 @@ class RetryPolicy:
             return False
 
         return failure.error_code in self.config.retryable_error_codes
+
+    def _calculate_delay(self, attempt_number: int) -> float:
+
+        delay = self.config.base_delay_seconds * (2 ** (attempt_number - 1))
+
+        return min(delay, self.config.max_delay_seconds)
