@@ -7,3 +7,4 @@ class ExecutionResult:
     success: bool
     output: Any | None = None
     error: str | None = None
+    error_code: str | None = None

@@ -2,6 +2,7 @@ from .attempt import Attempt, AttemptStatus
 from .attempt_state_machine import AttemptStateMachine
 from .execution import ExecutionResult
 from .executor import Executor
+from .retry_policy import FailureContext, RetryDecision, RetryPolicy
 from .run import Run, RunStatus
 from .state_machine import RunStateMachine
 from .step import Step, StepStatus
@@ -15,12 +16,14 @@ class Runtime:
         step_state_machine: StepStateMachine,
         attempt_state_machine: AttemptStateMachine,
         executor: Executor,
+        retry_policy: RetryPolicy,
     ):
 
         self.state_machine = state_machine
         self.step_state_machine = step_state_machine
         self.attempt_state_machine = attempt_state_machine
         self.executor = executor
+        self.retry_policy = retry_policy
 
     def transition_run(self, run: Run, target_state: RunStatus) -> bool:
 
@@ -94,19 +97,83 @@ class Runtime:
         self.transition_attempt(attempt, AttemptStatus.RUNNING)
 
         try:
-            result = self.execute_step(step, step_defination)
+            result = self._execute_attempt(step, attempt, step_defination)
 
         except Exception as exc:
             result = ExecutionResult(success=False, error=str(exc))
 
         if result.success:
             self.transition_attempt(attempt, AttemptStatus.SUCCEEDED)
-
             self.transition_step(step, StepStatus.COMPLETED)
+        else:
+            self.transition_attempt(
+                attempt,
+                AttemptStatus.FAILED,
+            )
+
+        decision = self._decide_retry(
+            step,
+            attempt,
+            result,
+        )
+
+        if decision.should_retry:
+            next_attempt = self._create_attempt(step)
+            self._start_attempt(next_attempt)
 
         else:
-            self.transition_attempt(attempt, AttemptStatus.FAILED)
-
             self.transition_step(step, StepStatus.FAILED)
 
         return result
+
+    def _build_failure_context(
+        self, step: Step, attempt: Attempt, result: ExecutionResult
+    ) -> FailureContext:
+
+        return FailureContext(
+            attempt_number=len(step.attempts),
+            error_type="ExecutionError",
+            error_code=result.error_code,
+            error_message=result.error,
+            operation=step.step_id,
+        )
+
+    def _decide_retry(
+        self, step: Step, attempt: Attempt, result: ExecutionResult
+    ) -> RetryDecision:
+
+        failure_context = self._build_failure_context(step, attempt, result)
+
+        return self.retry_policy.decide(failure=failure_context)
+
+    def _create_attempt(self, step: Step) -> Attempt:
+
+        attempt = Attempt(
+            attempt_id=f"{step.step_id}-attempt-{len(step.attempts) + 1}",
+            step_id=step.step_id,
+        )
+
+        step.attempts.append(attempt)
+
+        return attempt
+
+    def _start_attempt(self, attempt: Attempt) -> bool:
+
+        return self.transition_attempt(attempt, AttemptStatus.RUNNING)
+
+    def _execute_attempt(
+        self,
+        step: Step,
+        attempt: Attempt,
+        step_defination: str,
+    ) -> ExecutionResult:
+
+        try:
+            return self.executor.execute(step, step_defination)
+
+        except Exception as exc:
+            return ExecutionResult(
+                success=False,
+                error=str(exc),
+                error_code=type(exc).__name__,
+            )

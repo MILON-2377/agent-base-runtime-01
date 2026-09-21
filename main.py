@@ -1,9 +1,10 @@
+from runtime.retry_policy import RetryPolicy, RetryPolicyConfig
 from runtime.run import Run, RunStatus
-from runtime.runtime import RunTime
+from runtime.runtime import Runtime
 from runtime.state_machine import RunStateMachine
 
 state_machine = RunStateMachine()
-runtime = RunTime(state_machine)
+runtime = Runtime(state_machine)
 
 
 # -----------------------

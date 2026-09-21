@@ -1,3 +1,4 @@
+import random
 from dataclasses import dataclass
 
 
@@ -16,6 +17,7 @@ class RetryPolicyConfig:
     retryable_error_codes: set[str] | None = None
     base_delay_seconds: float = 1.0
     max_delay_seconds: float = 30.0
+    jitter_enabled: bool = False
 
 
 @dataclass
@@ -55,7 +57,7 @@ class RetryPolicy:
         )
 
     def _is_retryable(self, failure: FailureContext) -> bool:
-        if self.config.retryable_error_codes is None:
+        if not self.config.retryable_error_codes:
             return False
 
         if failure.error_code is None:
@@ -67,4 +69,9 @@ class RetryPolicy:
 
         delay = self.config.base_delay_seconds * (2 ** (attempt_number - 1))
 
-        return min(delay, self.config.max_delay_seconds)
+        delay = min(delay, self.config.max_delay_seconds)
+
+        if self.config.jitter_enabled:
+            delay = random.uniform(0, delay)
+
+        return delay
