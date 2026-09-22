@@ -16,6 +16,7 @@ def create_default_runtime(
     attempt_state_machine=None,
     executor=None,
     retry_policy=None,
+    sleeper=None,
 ) -> Runtime:
     return Runtime(
         state_machine=state_machine or RunStateMachine(),
@@ -26,7 +27,16 @@ def create_default_runtime(
         or RetryPolicy(
             RetryPolicyConfig(max_attempts=3, retryable_error_codes={"SERVICE_TIMEOUT"})
         ),
+        sleepr=sleeper or FakeSleeper(),
     )
+
+
+class FakeSleeper:
+    def __init__(self):
+        self.delays = []
+
+    def sleep(self, delay_seconds: float) -> None:
+        self.delays.append(delay_seconds)
 
 
 class MockExecutor(Executor):
@@ -306,45 +316,131 @@ def test_executor_exception_marks_attempt_and_step_failed():
     assert result.error == "API timeout"
 
 
-def test_retryable_failure_keeps_step_running():
+def test_retryable_failure_eventually_fails_after_max_attempts():
 
     config = RetryPolicyConfig(
         max_attempts=3,
-        retryable_error_codes={
-            "SERVICE_TIMEOUT",
-        },
-        base_delay_seconds=1.0,
-    )
-
-    retry_policy = RetryPolicy(config)
-
-    runtime = Runtime(
-        state_machine=RunStateMachine(),
-        step_state_machine=StepStateMachine(),
-        attempt_state_machine=AttemptStateMachine(),
-        executor=FailingMockExecutor(),
-        retry_policy=retry_policy,
-    )
-
-    step = Step(step_id="step-123", run_id="run-123")
-
-    result = runtime.execute_step(step, "search_hotels")
-
-    assert result.success is False
-    assert step.status == StepStatus.RUNNING
-    assert step.attempts[0].status == AttemptStatus.FAILED
-
-
-def test_retryable_failure_creates_second_attempt():
-
-    config = RetryPolicyConfig(
-        max_attempts=3, retryable_error_codes={"SERVICE_TIMEOUT"}
+        retryable_error_codes={"SERVICE_TIMEOUT"},
     )
 
     retry_policy = RetryPolicy(config)
 
     runtime = create_default_runtime(
-        executor=FailingMockExecutor(), retry_policy=retry_policy
+        executor=FailingMockExecutor(),
+        retry_policy=retry_policy,
+    )
+
+    step = Step(
+        step_id="step-123",
+        run_id="run-123",
+    )
+
+    result = runtime.execute_step(
+        step,
+        "search_hotels",
+    )
+
+    assert result.success is False
+
+    assert step.status == StepStatus.FAILED
+
+    assert len(step.attempts) == 3
+
+    assert step.attempts[0].status == AttemptStatus.FAILED
+    assert step.attempts[1].status == AttemptStatus.FAILED
+    assert step.attempts[2].status == AttemptStatus.FAILED
+
+
+class FailOnceExecutor(Executor):
+    def __init__(self):
+        self.calls = 0
+
+    def execute(self, step: Step, step_defination: str) -> ExecutionResult:
+
+        self.calls += 1
+
+        if self.calls == 1:
+            return ExecutionResult(
+                success=False, error="API timeout", error_code="SERVICE_TIMEOUT"
+            )
+
+        return ExecutionResult(success=True, output="Hotels found")
+
+
+def test_retry_succeeds_on_second_attempt():
+
+    executor = FailOnceExecutor()
+
+    retry_policy = RetryPolicy(
+        RetryPolicyConfig(max_attempts=3, retryable_error_codes={"SERVICE_TIMEOUT"})
+    )
+
+    runtime = create_default_runtime(executor=executor, retry_policy=retry_policy)
+
+    step = Step(step_id="step-123", run_id="run-123")
+
+    result = runtime.execute_step(step, "search_hotels")
+
+    assert result.success is True
+
+    assert executor.calls == 2
+
+    assert step.status == StepStatus.COMPLETED
+
+    assert len(step.attempts) == 2
+
+    assert step.attempts[0].status == AttemptStatus.FAILED
+    assert step.attempts[1].status == AttemptStatus.SUCCEEDED
+
+
+def test_retry_waits_before_next_attempt():
+
+    executor = FailOnceExecutor()
+
+    retry_policy = RetryPolicy(
+        RetryPolicyConfig(
+            max_attempts=3,
+            retryable_error_codes={"SERVICE_TIMEOUT"},
+            base_delay_seconds=2.0,
+        )
+    )
+
+    sleeper = FakeSleeper()
+
+    runtime = create_default_runtime(
+        executor=executor, retry_policy=retry_policy, sleeper=sleeper
+    )
+
+    step = Step(step_id="step-1", run_id="run-1")
+
+    result = runtime.execute_step(step, "search_hotels")
+
+    assert result.success is True
+
+    assert len(step.attempts) == 2
+
+    assert sleeper.delays == [2.0]
+
+
+class InvalidRequestExecutor(Executor):
+    def execute(self, step: Step, step_defination: str) -> ExecutionResult:
+        return ExecutionResult(
+            success=False, error="API timeout", error_code="INVALID_REQUEST"
+        )
+
+
+def test_no_retry_and_runtime_not_sleep():
+
+    executor = InvalidRequestExecutor()
+
+    retry_policy = RetryPolicy(
+        RetryPolicyConfig(max_attempts=3, retryable_error_codes={"SERVICE_TIMEOUT"})
+    )
+
+    sleeper = FakeSleeper()
+
+    runtime = create_default_runtime(
+        executor=executor, retry_policy=retry_policy, sleeper=FakeSleeper()
     )
 
     step = Step(step_id="step-123", run_id="run-123")
@@ -352,10 +448,53 @@ def test_retryable_failure_creates_second_attempt():
     result = runtime.execute_step(step, "search_hotels")
 
     assert result.success is False
+    assert len(step.attempts) == 1
 
-    assert step.status == StepStatus.RUNNING
+    assert sleeper.delays == []
 
-    assert len(step.attempts) == 2
 
-    assert step.attempts[0].status == AttemptStatus.FAILED
-    assert step.attempts[1].status == AttemptStatus.RUNNING
+class FailTwiceExecutor(Executor):
+    def __init__(self):
+        self.calls = 0
+
+    def execute(self, step: Step, step_definition: str) -> ExecutionResult:
+        self.calls += 1
+
+        if self.calls <= 2:
+            return ExecutionResult(
+                success=False,
+                error="API timeout",
+                error_code="SERVICE_TIMEOUT",
+            )
+
+        return ExecutionResult(
+            success=True,
+            output="Hotels found",
+        )
+
+
+def test_retry_twice_third_time_succeeds():
+    executor = FailTwiceExecutor()
+
+    retry_policy = RetryPolicy(
+        RetryPolicyConfig(
+            max_attempts=3,
+            retryable_error_codes={"SERVICE_TIMEOUT"},
+        )
+    )
+
+    sleeper = FakeSleeper()
+
+    runtime = create_default_runtime(
+        executor=executor,
+        retry_policy=retry_policy,
+        sleeper=sleeper,
+    )
+
+    step = Step(step_id="step-123", run_id="run-123")
+
+    result = runtime.execute_step(step, "search_hotels")
+
+    assert result.success is True
+    assert len(step.attempts) == 3
+    assert sleeper.delays == [1.0, 2.0]

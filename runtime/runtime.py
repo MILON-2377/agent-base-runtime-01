@@ -4,6 +4,7 @@ from .execution import ExecutionResult
 from .executor import Executor
 from .retry_policy import FailureContext, RetryDecision, RetryPolicy
 from .run import Run, RunStatus
+from .sleeper import Sleeper
 from .state_machine import RunStateMachine
 from .step import Step, StepStatus
 from .step_state_machine import StepStateMachine
@@ -17,6 +18,7 @@ class Runtime:
         attempt_state_machine: AttemptStateMachine,
         executor: Executor,
         retry_policy: RetryPolicy,
+        sleepr: Sleeper,
     ):
 
         self.state_machine = state_machine
@@ -24,6 +26,7 @@ class Runtime:
         self.attempt_state_machine = attempt_state_machine
         self.executor = executor
         self.retry_policy = retry_policy
+        self.sleepr = sleepr
 
     def transition_run(self, run: Run, target_state: RunStatus) -> bool:
 
@@ -65,66 +68,75 @@ class Runtime:
 
         return True
 
-    def execute_step(self, step: Step, step_defination: str) -> ExecutionResult:
+    def execute_step(
+        self,
+        step: Step,
+        step_definition: str,
+    ) -> ExecutionResult:
 
+        # Step must enter RUNNING exactly once.
         is_valid = self.step_state_machine.is_valid_transition(
-            step.status, StepStatus.RUNNING
+            step.status,
+            StepStatus.RUNNING,
         )
 
         if not is_valid:
             return ExecutionResult(
-                success=False, error="Step cannot transition to RUNNING"
+                success=False,
+                error="Step cannot transition to RUNNING",
             )
 
-        self.transition_step(step, StepStatus.RUNNING)
-
-        attempt = Attempt(
-            attempt_id=f"{step.step_id}-attempt-{len(step.attempts) + 1}",
-            step_id=step.step_id,
+        self.transition_step(
+            step,
+            StepStatus.RUNNING,
         )
 
-        step.attempts.append(attempt)
+        while True:
+            attempt = self._create_attempt(step)
 
-        is_valid_attempt_transition = self.attempt_state_machine.is_valid_transition(
-            attempt.status, AttemptStatus.RUNNING
-        )
+            self._start_attempt(attempt)
 
-        if not is_valid_attempt_transition:
-            return ExecutionResult(
-                success=False, error="Attempt cannot transition to RUNNING"
+            result = self._execute_attempt(
+                step,
+                attempt,
+                step_definition,
             )
 
-        self.transition_attempt(attempt, AttemptStatus.RUNNING)
+            if result.success:
+                self.transition_attempt(
+                    attempt,
+                    AttemptStatus.SUCCEEDED,
+                )
 
-        try:
-            result = self._execute_attempt(step, attempt, step_defination)
+                self.transition_step(
+                    step,
+                    StepStatus.COMPLETED,
+                )
 
-        except Exception as exc:
-            result = ExecutionResult(success=False, error=str(exc))
+                return result
 
-        if result.success:
-            self.transition_attempt(attempt, AttemptStatus.SUCCEEDED)
-            self.transition_step(step, StepStatus.COMPLETED)
-        else:
+            # Current Attempt failed.
             self.transition_attempt(
                 attempt,
                 AttemptStatus.FAILED,
             )
 
-        decision = self._decide_retry(
-            step,
-            attempt,
-            result,
-        )
+            decision = self._decide_retry(
+                step,
+                attempt,
+                result,
+            )
 
-        if decision.should_retry:
-            next_attempt = self._create_attempt(step)
-            self._start_attempt(next_attempt)
+            if decision.should_retry:
+                self.sleepr.sleep(decision.delay_seconds)
+                continue
 
-        else:
-            self.transition_step(step, StepStatus.FAILED)
+            self.transition_step(
+                step,
+                StepStatus.FAILED,
+            )
 
-        return result
+            return result
 
     def _build_failure_context(
         self, step: Step, attempt: Attempt, result: ExecutionResult
